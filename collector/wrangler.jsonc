@@ -1,0 +1,22 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "recocast-radar-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-29",
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "recocast-radar-db",
+      "database_id": "f14458dd-65ce-4c7f-aab9-449595cf9116"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RADAR_IMAGES",
+      "bucket_name": "recocast-radar-png"
+    }
+  ]
+}
+
