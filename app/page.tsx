@@ -5,12 +5,14 @@ import * as maplibregl from "maplibre-gl";
 import type { Map as MapLibreMap } from "maplibre-gl";
 
 const API = "https://recocast-radar-api.h6fgpg2zht.workers.dev";
-const PREFECTURE_GEOJSON_URL = "https://raw.githubusercontent.com/wvdtc7bjwn-bit/MeteoScope/main/public/data/japan-prefectures-map.geojson";
-const FIRST_PREFECTURE_LAYER = "prefecture-shadow";
+const PREFECTURE_GEOJSON_URL = "./data/japan-prefectures-map.geojson";
 
 type Tile = { x: number; y: number };
 type Frame = { valid_time: string; base_time: string; tile_count: number; total_bytes: number; event_id: string | null; tiles: Tile[] };
 type Stats = { frame_count: number; total_bytes: number; oldest_time: string | null; latest_time: string | null; event_count: number; retentionDays: number };
+type Position = [number, number];
+type PrefectureGeometry = { type: "Polygon"; coordinates: Position[][] } | { type: "MultiPolygon"; coordinates: Position[][][] };
+type PrefectureCollection = { features: { geometry: PrefectureGeometry }[] };
 
 function radarDate(value: string) {
   return new Date(Date.UTC(Number(value.slice(0, 4)), Number(value.slice(4, 6)) - 1, Number(value.slice(6, 8)), Number(value.slice(8, 10)), Number(value.slice(10, 12))));
@@ -51,6 +53,7 @@ function tileCoordinates(x: number, y: number, zoom: number): [[number, number],
 
 function JapanMap({ frame, opacity, tiles, zoom, overviewTiles, overviewZoom }: { frame?: Frame; opacity: number; tiles: Tile[]; zoom: number; overviewTiles: Tile[]; overviewZoom: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const borderCanvasRef = useRef<HTMLCanvasElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [detailedRadar, setDetailedRadar] = useState(false);
@@ -90,15 +93,71 @@ function JapanMap({ frame, opacity, tiles, zoom, overviewTiles, overviewZoom }: 
     map.keyboard.disableRotation();
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
-    map.on("load", () => {
-      map.addSource("prefectures", { type: "geojson", data: PREFECTURE_GEOJSON_URL, attribution: "都道府県境界：気象庁GISデータ（MeteoScope加工）" });
-      map.addLayer({ id: "prefecture-shadow", type: "line", source: "prefectures", paint: { "line-color": "#071116", "line-width": ["interpolate", ["linear"], ["zoom"], 3, 3.4, 9, 5.5], "line-opacity": 1 } });
-      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 3, 1.5, 9, 2.5], "line-opacity": 1 } });
-      setMapReady(true);
-    });
+    map.on("load", () => setMapReady(true));
     map.on("zoomend", () => setDetailedRadar(map.getZoom() >= 7));
+
+    let cancelled = false;
+    let prefectures: PrefectureCollection | null = null;
+    const drawPrefectureBorders = () => {
+      const canvas = borderCanvasRef.current;
+      if (!canvas || !prefectures) return;
+      const mapCanvas = map.getCanvas();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = mapCanvas.clientWidth;
+      const height = mapCanvas.clientHeight;
+      if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+        canvas.width = Math.round(width * ratio);
+        canvas.height = Math.round(height * ratio);
+      }
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width, height);
+      context.beginPath();
+      const drawRing = (ring: Position[]) => {
+        ring.forEach(([longitude, latitude], index) => {
+          const point = map.project([longitude, latitude]);
+          if (index === 0) context.moveTo(point.x, point.y);
+          else context.lineTo(point.x, point.y);
+        });
+        context.closePath();
+      };
+      prefectures.features.forEach(({ geometry }) => {
+        if (geometry.type === "Polygon") geometry.coordinates.forEach(drawRing);
+        else geometry.coordinates.forEach((polygon) => polygon.forEach(drawRing));
+      });
+      const zoomScale = Math.max(0, Math.min(1, (map.getZoom() - 3) / 6));
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.strokeStyle = "rgba(0, 0, 0, .95)";
+      context.lineWidth = 4.5 + zoomScale * 2.5;
+      context.stroke();
+      context.strokeStyle = "#ffffff";
+      context.lineWidth = 2 + zoomScale * 2;
+      context.stroke();
+    };
+    map.on("moveend", drawPrefectureBorders);
+    map.on("resize", drawPrefectureBorders);
+    fetch(PREFECTURE_GEOJSON_URL)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Prefecture GeoJSON: ${response.status}`);
+        return response.json() as Promise<PrefectureCollection>;
+      })
+      .then((data) => {
+        if (!cancelled) {
+          prefectures = data;
+          drawPrefectureBorders();
+        }
+      })
+      .catch((error) => console.error("Failed to draw prefecture borders", error));
     mapRef.current = map;
-    return () => { map.remove(); mapRef.current = null; };
+    return () => {
+      cancelled = true;
+      map.off("moveend", drawPrefectureBorders);
+      map.off("resize", drawPrefectureBorders);
+      map.remove();
+      mapRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -116,7 +175,7 @@ function JapanMap({ frame, opacity, tiles, zoom, overviewTiles, overviewZoom }: 
         url: tileUrl(frame, x, y, displayZoom),
         coordinates: tileCoordinates(x, y, displayZoom),
       });
-      map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": opacity, "raster-fade-duration": 0, "raster-resampling": "nearest" } }, FIRST_PREFECTURE_LAYER);
+      map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": opacity, "raster-fade-duration": 0, "raster-resampling": "nearest" } });
     });
   }, [detailedRadar, frame, mapReady, opacity, overviewTiles, overviewZoom, tiles, zoom]);
 
@@ -129,7 +188,7 @@ function JapanMap({ frame, opacity, tiles, zoom, overviewTiles, overviewZoom }: 
     });
   }, [opacity, tiles]);
 
-  return <div ref={containerRef} className="map-canvas" aria-label="気象庁ナウキャストを重ねたMapLibre日本地図" />;
+  return <><div ref={containerRef} className="map-canvas" aria-label="気象庁ナウキャストを重ねたMapLibre日本地図" /><canvas ref={borderCanvasRef} className="prefecture-overlay" aria-hidden="true" /></>;
 }
 
 export default function Home() {
