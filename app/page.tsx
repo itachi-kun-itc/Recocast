@@ -52,35 +52,39 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
       zoom: 4.45,
       pitch: 0,
       bearing: 0,
-      minZoom: 3,
-      maxZoom: 12,
+      minZoom: 4.45,
+      maxZoom: 4.45,
       maxPitch: 0,
+      scrollZoom: false,
+      boxZoom: false,
+      doubleClickZoom: false,
+      keyboard: false,
       dragRotate: false,
       pitchWithRotate: false,
       touchPitch: false,
+      touchZoomRotate: false,
       attributionControl: false,
       style: {
         version: 8,
         sources: {
-          basemap: {
+          satellite: {
             type: "raster",
-            tiles: ["https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png"],
+            tiles: ["https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"],
             tileSize: 256,
-            attribution: "地理院タイル（標準地図）",
+            attribution: "地理院タイル（全国最新写真）",
           },
         },
         layers: [
           { id: "ocean", type: "background", paint: { "background-color": "#061a20" } },
-          { id: "basemap", type: "raster", source: "basemap", paint: { "raster-saturation": -.18, "raster-contrast": .05 } },
+          { id: "satellite", type: "raster", source: "satellite", paint: { "raster-saturation": -.3, "raster-brightness-max": .74 } },
         ],
       },
     });
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
     map.on("load", () => {
       map.addSource("prefectures", { type: "geojson", data: "https://raw.githubusercontent.com/geolonia/prefecture-tiles/master/prefectures.geojson" });
       map.addLayer({ id: "prefecture-fill", type: "fill", source: "prefectures", paint: { "fill-color": "rgba(0,0,0,0)", "fill-opacity": 0 } });
-      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "rgba(255,255,255,.95)", "line-width": ["interpolate", ["linear"], ["zoom"], 4, .65, 8, 1.25], "line-blur": .1 } });
+      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "#ffffff", "line-width": 1.15, "line-opacity": 1, "line-blur": .05 } });
       setMapReady(true);
     });
     mapRef.current = map;
