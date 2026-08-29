@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "maplibre-gl/dist/maplibre-gl.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://itachi-kun-itc.github.io/Recocast/"),

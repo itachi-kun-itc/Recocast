@@ -15,8 +15,13 @@ type TargetTime = { basetime: string; validtime: string; elements: string[] };
 const JMA_TIMES = "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json";
 const JMA_ROOT = "https://www.jma.go.jp/bosai/jmatile/data/nowc";
 const ALLOWED_ORIGINS = new Set(["https://itachi-kun-itc.github.io", "http://localhost:3000"]);
-const ZOOM = 5;
-const TILES = Array.from({ length: 4 * 3 }, (_, index) => ({ x: 26 + (index % 4), y: 11 + Math.floor(index / 4) }));
+const ZOOM = 6;
+const TILE_COLUMNS = 7;
+const TILE_ROWS = 6;
+const TILES = Array.from({ length: TILE_COLUMNS * TILE_ROWS }, (_, index) => ({
+  x: 53 + (index % TILE_COLUMNS),
+  y: 22 + Math.floor(index / TILE_COLUMNS),
+}));
 
 function cors(request: Request) {
   const origin = request.headers.get("origin") || "";
@@ -63,8 +68,11 @@ async function collectLatest(env: Env) {
   const targets = await targetsResponse.json() as TargetTime[];
   const target = targets.find((item) => item.elements.includes("hrpns") && item.basetime === item.validtime);
   if (!target) throw new Error("No observed radar frame available");
-  const exists = await env.DB.prepare("SELECT valid_time FROM radar_frames WHERE valid_time = ? AND status = 'ready'").bind(target.validtime).first();
-  if (exists) { await cleanup(env); return; }
+  const exists = await env.DB.prepare("SELECT valid_time, tile_count FROM radar_frames WHERE valid_time = ? AND status = 'ready'").bind(target.validtime).first<{ valid_time: string; tile_count: number }>();
+  if (exists?.tile_count === TILES.length && await env.RADAR_IMAGES.head(`frames/${target.validtime}/${ZOOM}/${TILES[0].x}/${TILES[0].y}.png`)) {
+    await cleanup(env);
+    return;
+  }
 
   await env.DB.prepare("INSERT OR REPLACE INTO radar_frames (valid_time, base_time, status, tile_count, total_bytes, created_at) VALUES (?, ?, 'collecting', 0, 0, ?)")
     .bind(target.validtime, target.basetime, new Date().toISOString()).run();
@@ -93,7 +101,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   await ensureSchema(env);
 
   if (url.pathname === "/api/frames" && request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT valid_time, base_time, tile_count, total_bytes, event_id FROM radar_frames WHERE status = 'ready' ORDER BY valid_time DESC LIMIT 900").all();
+    const rows = await env.DB.prepare("SELECT valid_time, base_time, tile_count, total_bytes, event_id FROM radar_frames WHERE status = 'ready' AND tile_count = ? ORDER BY valid_time DESC LIMIT 900").bind(TILES.length).all();
     if (!rows.results.length) ctx.waitUntil(collectLatest(env));
     return json(request, { frames: rows.results, zoom: ZOOM, tiles: TILES, retentionDays: 3 });
   }
@@ -123,7 +131,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   }
 
   if (url.pathname === "/api/stats" && request.method === "GET") {
-    const stats = await env.DB.prepare("SELECT COUNT(*) AS frame_count, COALESCE(SUM(total_bytes), 0) AS total_bytes, MIN(valid_time) AS oldest_time, MAX(valid_time) AS latest_time FROM radar_frames WHERE status = 'ready'").first();
+    const stats = await env.DB.prepare("SELECT COUNT(*) AS frame_count, COALESCE(SUM(total_bytes), 0) AS total_bytes, MIN(valid_time) AS oldest_time, MAX(valid_time) AS latest_time FROM radar_frames WHERE status = 'ready' AND tile_count = ?").bind(TILES.length).first();
     const events = await env.DB.prepare("SELECT COUNT(*) AS event_count FROM radar_events").first();
     return json(request, { ...stats, ...events, retentionDays: 3 });
   }
@@ -139,7 +147,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
     return new Response(object.body, { headers });
   }
 
-  if (url.pathname === "/health") return json(request, { ok: true, source: "気象庁 高解像度降水ナウキャスト", retentionDays: 3 });
+  if (url.pathname === "/health") return json(request, { ok: true, source: "気象庁・高解像度降水ナウキャスト", retentionDays: 3, zoom: ZOOM });
   return json(request, { error: "Not found" }, { status: 404 });
 }
 
@@ -149,4 +157,3 @@ export default {
     ctx.waitUntil(collectLatest(env));
   },
 };
-

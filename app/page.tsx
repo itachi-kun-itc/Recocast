@@ -1,14 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as maplibregl from "maplibre-gl";
+import type { Map as MapLibreMap } from "maplibre-gl";
 
 const API = "https://recocast-radar-api.h6fgpg2zht.workers.dev";
 
 type Frame = { valid_time: string; base_time: string; tile_count: number; total_bytes: number; event_id: string | null };
 type Tile = { x: number; y: number };
 type Stats = { frame_count: number; total_bytes: number; oldest_time: string | null; latest_time: string | null; event_count: number; retentionDays: number };
-type GeoGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: number[][][][] | number[][][] };
-type GeoCollection = { features: Array<{ geometry: GeoGeometry }> };
 
 function radarDate(value: string) {
   return new Date(Date.UTC(Number(value.slice(0, 4)), Number(value.slice(4, 6)) - 1, Number(value.slice(6, 8)), Number(value.slice(8, 10)), Number(value.slice(10, 12))));
@@ -40,100 +40,70 @@ function tileUrl(frame: Frame, x: number, y: number, zoom: number) {
 }
 
 function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: number; tiles: Tile[]; zoom: number }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [geo, setGeo] = useState<GeoCollection | null>(null);
-  const [resizeVersion, setResizeVersion] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<MapLibreMap | null>(null);
+  const [mapReady, setMapReady] = useState(false);
 
   useEffect(() => {
-    fetch("https://raw.githubusercontent.com/geolonia/prefecture-tiles/master/prefectures.geojson")
-      .then(async (response) => (await response.json()) as GeoCollection)
-      .then(setGeo)
-      .catch(() => setGeo(null));
+    if (!containerRef.current || mapRef.current) return;
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      center: [137.3, 36.2],
+      zoom: 4.45,
+      minZoom: 3,
+      maxZoom: 12,
+      attributionControl: false,
+      style: {
+        version: 8,
+        sources: {
+          satellite: {
+            type: "raster",
+            tiles: ["https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"],
+            tileSize: 256,
+            attribution: "地理院タイル（全国最新写真）",
+          },
+        },
+        layers: [
+          { id: "ocean", type: "background", paint: { "background-color": "#061a20" } },
+          { id: "satellite", type: "raster", source: "satellite", paint: { "raster-saturation": -.35, "raster-brightness-max": .72 } },
+        ],
+      },
+    });
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+    map.on("load", () => {
+      map.addSource("prefectures", { type: "geojson", data: "https://raw.githubusercontent.com/geolonia/prefecture-tiles/master/prefectures.geojson" });
+      map.addLayer({ id: "prefecture-fill", type: "fill", source: "prefectures", paint: { "fill-color": "rgba(0,0,0,0)", "fill-opacity": 0 } });
+      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "rgba(255,255,255,.95)", "line-width": ["interpolate", ["linear"], ["zoom"], 4, .65, 8, 1.25], "line-blur": .1 } });
+      setMapReady(true);
+    });
+    mapRef.current = map;
+    return () => { map.remove(); mapRef.current = null; };
   }, []);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const observer = new ResizeObserver(() => setResizeVersion((version) => version + 1));
-    observer.observe(canvas);
-    return () => observer.disconnect();
-  }, []);
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    if (map.getLayer("radar")) map.removeLayer("radar");
+    if (map.getSource("radar")) map.removeSource("radar");
+    if (!frame || !tiles.length) return;
+    map.addSource("radar", {
+      type: "raster",
+      tiles: [`${API}/api/frames/${frame.valid_time}/tiles/${zoom}/{x}/{y}.png`],
+      tileSize: 256,
+      minzoom: zoom,
+      maxzoom: zoom,
+      bounds: [122.4, 23, 153.9, 46.1],
+    });
+    map.addLayer({ id: "radar", type: "raster", source: "radar", paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, "prefecture-border");
+  }, [frame, mapReady, tiles.length, zoom]);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !geo) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    let cancelled = false;
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(rect.width * dpr);
-    canvas.height = Math.round(rect.height * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const map = mapRef.current;
+    if (map?.getLayer("radar")) map.setPaintProperty("radar", "raster-opacity", opacity);
+  }, [opacity]);
 
-    const width = rect.width, height = rect.height;
-    const minLon = 122.4, maxLon = 153.9, minLat = 23, maxLat = 46.1;
-    const mercatorY = (lat: number) => (1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2;
-    const minX = (minLon + 180) / 360, maxX = (maxLon + 180) / 360, minY = mercatorY(maxLat), maxY = mercatorY(minLat);
-    const worldToCanvas = (x: number, y: number) => [((x - minX) / (maxX - minX)) * width, ((y - minY) / (maxY - minY)) * height] as const;
-    const project = ([lon, lat]: number[]) => worldToCanvas((lon + 180) / 360, mercatorY(lat));
-    const forEachRing = (draw: (ring: number[][]) => void) => {
-      geo.features.forEach(({ geometry }) => {
-        const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : geometry.coordinates as number[][][][];
-        polygons.forEach((polygon) => polygon.forEach(draw));
-      });
-    };
-
-    const land = new Path2D();
-    forEachRing((ring) => {
-      ring.forEach((point, index) => { const [x, y] = project(point); if (index === 0) land.moveTo(x, y); else land.lineTo(x, y); });
-      land.closePath();
-    });
-
-    const drawTerrain = () => {
-      const ocean = ctx.createRadialGradient(width * .58, height * .42, 20, width * .55, height * .45, width * .82);
-      ocean.addColorStop(0, "#173c45"); ocean.addColorStop(.48, "#0a2932"); ocean.addColorStop(1, "#04171d");
-      ctx.fillStyle = ocean; ctx.fillRect(0, 0, width, height);
-      ctx.globalAlpha = .18; ctx.strokeStyle = "#5f98a0"; ctx.lineWidth = .45;
-      for (let x = -height; x < width + height; x += 46) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + height, height); ctx.stroke(); }
-      ctx.globalAlpha = 1;
-      const terrain = ctx.createLinearGradient(width * .2, 0, width * .8, height);
-      terrain.addColorStop(0, "#26483d"); terrain.addColorStop(.48, "#69735a"); terrain.addColorStop(1, "#25443a");
-      ctx.fillStyle = terrain; ctx.fill(land, "evenodd");
-      ctx.save(); ctx.clip(land, "evenodd");
-      for (let index = 0; index < 140; index += 1) {
-        const x = (((index * 83) % 1000) / 1000) * width, y = (((index * 137) % 997) / 997) * height;
-        ctx.fillStyle = index % 3 ? "rgba(235,221,170,.05)" : "rgba(2,25,21,.14)";
-        ctx.beginPath(); ctx.ellipse(x, y, 18 + (index % 7) * 9, 4 + (index % 5) * 4, -.6, 0, Math.PI * 2); ctx.fill();
-      }
-      ctx.restore();
-    };
-
-    const drawBorders = () => {
-      ctx.save(); ctx.strokeStyle = "rgba(255,255,255,.95)"; ctx.lineWidth = .8; ctx.shadowColor = "rgba(0,0,0,.45)"; ctx.shadowBlur = 2;
-      forEachRing((ring) => {
-        ctx.beginPath();
-        ring.forEach((point, index) => { const [x, y] = project(point); if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
-        ctx.closePath(); ctx.stroke();
-      });
-      ctx.restore();
-    };
-
-    drawTerrain();
-    if (!frame) { drawBorders(); return; }
-    const scale = 2 ** zoom;
-    Promise.all(tiles.map(({ x, y }) => new Promise<{ image: HTMLImageElement; x: number; y: number } | null>((resolve) => {
-      const image = new Image(); image.crossOrigin = "anonymous"; image.onload = () => resolve({ image, x, y }); image.onerror = () => resolve(null); image.src = tileUrl(frame, x, y, zoom);
-    }))).then((loaded) => {
-      if (cancelled) return;
-      ctx.save(); ctx.globalAlpha = opacity;
-      loaded.forEach((tile) => { if (!tile) return; const [left, top] = worldToCanvas(tile.x / scale, tile.y / scale); const [right, bottom] = worldToCanvas((tile.x + 1) / scale, (tile.y + 1) / scale); ctx.drawImage(tile.image, left, top, right - left, bottom - top); });
-      ctx.restore(); drawBorders();
-    });
-    return () => { cancelled = true; };
-  }, [geo, frame, opacity, resizeVersion, tiles, zoom]);
-
-  return <canvas ref={canvasRef} className="map-canvas" aria-label="気象庁ナウキャストを重ねた日本地図" />;
+  return <div ref={containerRef} className="map-canvas" aria-label="気象庁ナウキャストを重ねたMapLibre日本地図" />;
 }
 
 export default function Home() {
@@ -190,7 +160,17 @@ export default function Home() {
     <div className="action-float"><span className="live-chip"><i />実況</span><span className="archive-count">{stats ? `${stats.frame_count}時刻・${formatBytes(stats.total_bytes)}` : "接続中"}</span><button disabled={!frames.length} onClick={openArchive}>この流れを保存</button></div>
     <div className="selected-time"><span>表示時刻</span><strong>{current ? formatClock(current.valid_time) : "--:--"}</strong><small>{current ? formatDay(current.valid_time) : "雨雲データを取得中"}</small></div>
     {!current && <div className="empty-state"><span className="drop-icon">⌁</span><strong>雨雲レーダーを準備中</strong><small>自動取得したPNGを地図に重ねて表示します</small></div>}
-    <div className="rain-legend"><span>雨量</span><i /><small>弱</small><small>強</small></div>
+    <div className="rain-legend" aria-label="気象庁と同じ降水強度の凡例">
+      <strong>降水強度</strong><span>mm/h</span>
+      <div className="legend-row"><i style={{ background: "#b40068" }} /><b>80〜</b></div>
+      <div className="legend-row"><i style={{ background: "#ff2800" }} /><b>50〜80</b></div>
+      <div className="legend-row"><i style={{ background: "#ff9900" }} /><b>30〜50</b></div>
+      <div className="legend-row"><i style={{ background: "#faf500" }} /><b>20〜30</b></div>
+      <div className="legend-row"><i style={{ background: "#0041ff" }} /><b>10〜20</b></div>
+      <div className="legend-row"><i style={{ background: "#218cff" }} /><b>5〜10</b></div>
+      <div className="legend-row"><i style={{ background: "#a0d2ff" }} /><b>1〜5</b></div>
+      <div className="legend-row"><i style={{ background: "#f2f2ff" }} /><b>0〜1</b></div>
+    </div>
     <div className="map-attribution">出典：気象庁「高解像度降水ナウキャスト」を加工して表示</div>
 
     <section className="time-dock" aria-label="時刻タイムライン">
