@@ -50,22 +50,28 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
       container: containerRef.current,
       center: [137.3, 36.2],
       zoom: 4.45,
+      pitch: 0,
+      bearing: 0,
       minZoom: 3,
       maxZoom: 12,
+      maxPitch: 0,
+      dragRotate: false,
+      pitchWithRotate: false,
+      touchPitch: false,
       attributionControl: false,
       style: {
         version: 8,
         sources: {
-          satellite: {
+          basemap: {
             type: "raster",
-            tiles: ["https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"],
+            tiles: ["https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png"],
             tileSize: 256,
-            attribution: "地理院タイル（全国最新写真）",
+            attribution: "地理院タイル（標準地図）",
           },
         },
         layers: [
           { id: "ocean", type: "background", paint: { "background-color": "#061a20" } },
-          { id: "satellite", type: "raster", source: "satellite", paint: { "raster-saturation": -.35, "raster-brightness-max": .72 } },
+          { id: "basemap", type: "raster", source: "basemap", paint: { "raster-saturation": -.18, "raster-contrast": .05 } },
         ],
       },
     });
