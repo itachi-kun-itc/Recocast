@@ -110,6 +110,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
     if (!body.title || !body.startTime || !body.endTime || body.startTime > body.endTime) return json(request, { error: "Invalid event" }, { status: 400 });
     const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM radar_events").first<{ count: number }>();
     if ((count?.count || 0) >= 100) return json(request, { error: "Archive limit reached" }, { status: 409 });
+    const projected = await env.DB.prepare("SELECT COALESCE(SUM(total_bytes), 0) AS bytes FROM radar_frames WHERE event_id IS NOT NULL OR valid_time BETWEEN ? AND ?")
+      .bind(body.startTime, body.endTime).first<{ bytes: number }>();
+    if ((projected?.bytes || 0) > 7 * 1024 * 1024 * 1024) return json(request, { error: "Long-term archive storage guard reached" }, { status: 413 });
     const id = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     await env.DB.batch([
