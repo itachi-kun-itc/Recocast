@@ -25,3 +25,16 @@ CREATE TABLE IF NOT EXISTS radar_events (
 CREATE INDEX IF NOT EXISTS radar_events_created_at_idx
   ON radar_events(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS radar_collection_progress (
+  valid_time TEXT PRIMARY KEY,
+  next_tile INTEGER NOT NULL DEFAULT 0,
+  total_bytes INTEGER NOT NULL DEFAULT 0,
+  locked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS radar_frame_manifests (
+  valid_time TEXT PRIMARY KEY,
+  zoom INTEGER NOT NULL,
+  tiles_json TEXT NOT NULL
+);
+

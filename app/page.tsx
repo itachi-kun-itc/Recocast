@@ -5,9 +5,11 @@ import * as maplibregl from "maplibre-gl";
 import type { Map as MapLibreMap } from "maplibre-gl";
 
 const API = "https://recocast-radar-api.h6fgpg2zht.workers.dev";
+const PREFECTURE_GEOJSON_URL = "https://raw.githubusercontent.com/wvdtc7bjwn-bit/MeteoScope/main/public/data/japan-prefectures-map.geojson";
+const FIRST_PREFECTURE_LAYER = "prefecture-shadow";
 
-type Frame = { valid_time: string; base_time: string; tile_count: number; total_bytes: number; event_id: string | null };
 type Tile = { x: number; y: number };
+type Frame = { valid_time: string; base_time: string; tile_count: number; total_bytes: number; event_id: string | null; tiles: Tile[] };
 type Stats = { frame_count: number; total_bytes: number; oldest_time: string | null; latest_time: string | null; event_count: number; retentionDays: number };
 
 function radarDate(value: string) {
@@ -47,10 +49,11 @@ function tileCoordinates(x: number, y: number, zoom: number): [[number, number],
   return [[west, north], [east, north], [east, south], [west, south]];
 }
 
-function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: number; tiles: Tile[]; zoom: number }) {
+function JapanMap({ frame, opacity, tiles, zoom, overviewTiles, overviewZoom }: { frame?: Frame; opacity: number; tiles: Tile[]; zoom: number; overviewTiles: Tile[]; overviewZoom: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const [mapReady, setMapReady] = useState(false);
+  const [detailedRadar, setDetailedRadar] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -61,7 +64,7 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
       pitch: 0,
       bearing: 0,
       minZoom: 3,
-      maxZoom: 7.5,
+      maxZoom: 9,
       maxPitch: 0,
       dragRotate: false,
       pitchWithRotate: false,
@@ -88,11 +91,12 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
     map.on("load", () => {
-      map.addSource("prefectures", { type: "geojson", data: "https://raw.githubusercontent.com/geolonia/prefecture-tiles/master/prefectures.geojson" });
-      map.addLayer({ id: "prefecture-fill", type: "fill", source: "prefectures", paint: { "fill-color": "rgba(0,0,0,0)", "fill-opacity": 0 } });
-      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "#ffffff", "line-width": 1.15, "line-opacity": 1, "line-blur": .05 } });
+      map.addSource("prefectures", { type: "geojson", data: PREFECTURE_GEOJSON_URL, attribution: "都道府県境界：気象庁GISデータ（MeteoScope加工）" });
+      map.addLayer({ id: "prefecture-shadow", type: "line", source: "prefectures", paint: { "line-color": "#071116", "line-width": ["interpolate", ["linear"], ["zoom"], 3, 3.4, 9, 5.5], "line-opacity": 1 } });
+      map.addLayer({ id: "prefecture-border", type: "line", source: "prefectures", paint: { "line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 3, 1.5, 9, 2.5], "line-opacity": 1 } });
       setMapReady(true);
     });
+    map.on("zoomend", () => setDetailedRadar(map.getZoom() >= 7));
     mapRef.current = map;
     return () => { map.remove(); mapRef.current = null; };
   }, []);
@@ -100,22 +104,21 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    tiles.forEach(({ x, y }) => {
-      const id = `radar-${x}-${y}`;
-      if (map.getLayer(id)) map.removeLayer(id);
-      if (map.getSource(id)) map.removeSource(id);
-    });
-    if (!frame || !tiles.length) return;
-    tiles.forEach(({ x, y }) => {
+    map.getStyle().layers.filter(({ id }) => id.startsWith("radar-")).forEach(({ id }) => map.removeLayer(id));
+    Object.keys(map.getStyle().sources).filter((id) => id.startsWith("radar-")).forEach((id) => map.removeSource(id));
+    const displayTiles = detailedRadar ? tiles : overviewTiles;
+    const displayZoom = detailedRadar ? zoom : overviewZoom;
+    if (!frame || !displayTiles.length) return;
+    displayTiles.forEach(({ x, y }) => {
       const id = `radar-${x}-${y}`;
       map.addSource(id, {
         type: "image",
-        url: tileUrl(frame, x, y, zoom),
-        coordinates: tileCoordinates(x, y, zoom),
+        url: tileUrl(frame, x, y, displayZoom),
+        coordinates: tileCoordinates(x, y, displayZoom),
       });
-      map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, "prefecture-border");
+      map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": opacity, "raster-fade-duration": 0, "raster-resampling": "nearest" } }, FIRST_PREFECTURE_LAYER);
     });
-  }, [frame, mapReady, tiles, zoom]);
+  }, [detailedRadar, frame, mapReady, opacity, overviewTiles, overviewZoom, tiles, zoom]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -130,17 +133,18 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
 }
 
 export default function Home() {
-  const [frames, setFrames] = useState<Frame[]>([]), [tiles, setTiles] = useState<Tile[]>([]), [zoom, setZoom] = useState(5);
+  const [frames, setFrames] = useState<Frame[]>([]), [zoom, setZoom] = useState(5);
+  const [overviewTiles, setOverviewTiles] = useState<Tile[]>([]), [overviewZoom, setOverviewZoom] = useState(6);
   const [stats, setStats] = useState<Stats | null>(null), [active, setActive] = useState(0);
-  const [opacity, setOpacity] = useState(.78), [isPlaying, setIsPlaying] = useState(false), [archiveOpen, setArchiveOpen] = useState(false);
+  const [opacity, setOpacity] = useState(.9), [isPlaying, setIsPlaying] = useState(false), [archiveOpen, setArchiveOpen] = useState(false);
   const [archiveTitle, setArchiveTitle] = useState("大雨の記録"), [startTime, setStartTime] = useState(""), [endTime, setEndTime] = useState("");
   const [message, setMessage] = useState(""), [saving, setSaving] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
       const [framesResponse, statsResponse] = await Promise.all([fetch(`${API}/api/frames`), fetch(`${API}/api/stats`)]);
-      const frameData = await framesResponse.json() as { frames: Frame[]; tiles: Tile[]; zoom: number };
-      setFrames(frameData.frames); setTiles(frameData.tiles); setZoom(frameData.zoom); setStats(await statsResponse.json() as Stats); setMessage("");
+      const frameData = await framesResponse.json() as { frames: Frame[]; zoom: number; overviewTiles: Tile[]; overviewZoom: number };
+      setFrames(frameData.frames); setZoom(frameData.zoom); setOverviewTiles(frameData.overviewTiles); setOverviewZoom(frameData.overviewZoom); setStats(await statsResponse.json() as Stats); setMessage("");
     } catch { setMessage("雨雲データへ接続できません。しばらくしてから再読み込みしてください。"); }
   }, []);
 
@@ -196,7 +200,7 @@ export default function Home() {
   };
 
   return <main className="map-shell">
-    <section className="fullscreen-map"><JapanMap frame={current} opacity={opacity} tiles={tiles} zoom={zoom} /><div className="map-vignette" /></section>
+    <section className="fullscreen-map"><JapanMap frame={current} opacity={opacity} tiles={current?.tiles || []} zoom={zoom} overviewTiles={overviewTiles} overviewZoom={overviewZoom} /><div className="map-vignette" /></section>
     <div className="brand-float"><span className="brand-mark">R</span><span className="brand-copy"><strong>Recocast</strong><small>RAIN ARCHIVE</small></span></div>
     <div className="action-float"><span className="live-chip"><i />実況</span><span className="archive-count">{stats ? `${stats.frame_count}時刻・${formatBytes(stats.total_bytes)}` : "接続中"}</span><button disabled={!frames.length} onClick={openArchive}>この流れを保存</button></div>
     <div className="selected-time"><span>表示時刻</span><strong>{current ? formatClock(current.valid_time) : "--:--"}</strong><small>{current ? formatDay(current.valid_time) : "雨雲データを取得中"}</small></div>
@@ -220,16 +224,17 @@ export default function Home() {
       <div className="slider-panel">
         <div className="slider-stage"><div className="tick-rail" /><input className="timeline-slider" type="range" min="0" max={Math.max(0, frames.length - 1)} value={Math.max(0, frames.length - 1 - active)} onChange={(event) => setActive(Math.max(0, frames.length - 1 - Number(event.target.value)))} aria-label="雨雲レーダーの時刻を移動" /></div>
         <div className="time-labels">{markerIndices.map((index, marker) => <span key={`${index}-${marker}`}><b>{formatClock(frames[index].valid_time)}</b><small>{formatDay(frames[index].valid_time)}</small></span>)}</div>
-        <div className="range-caption"><span>3日前</span><span>現在</span></div>
+        <div className="range-caption"><span>36時間前</span><span>現在</span></div>
       </div>
       <label className="opacity-control"><span>雨雲の濃さ</span><input type="range" min="20" max="100" value={opacity * 100} onChange={(event) => setOpacity(Number(event.target.value) / 100)} /><b>{Math.round(opacity * 100)}%</b></label>
     </section>
 
     {message && <div className="toast" role="status">{message}</div>}
     {archiveOpen && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setArchiveOpen(false)}><section className="archive-panel" role="dialog" aria-modal="true" aria-label="雨雲の流れを長期保存">
-      <button className="close-button" onClick={() => setArchiveOpen(false)} aria-label="閉じる">×</button><p className="eyebrow">PERMANENT ARCHIVE</p><h2>この雨雲の流れを保存</h2><p className="panel-lead">指定した期間を、3日後も消えない大雨イベントとして保管します。</p>
+      <button className="close-button" onClick={() => setArchiveOpen(false)} aria-label="閉じる">×</button><p className="eyebrow">PERMANENT ARCHIVE</p><h2>この雨雲の流れを保存</h2><p className="panel-lead">指定した期間を、36時間後も消えない大雨イベントとして保管します。</p>
       <div className="field-grid"><label className="title-field"><span>記録名</span><input value={archiveTitle} onChange={(event) => setArchiveTitle(event.target.value)} /></label><label><span>開始</span><input type="datetime-local" value={startTime} onChange={(event) => setStartTime(event.target.value)} /></label><label><span>終了</span><input type="datetime-local" value={endTime} onChange={(event) => setEndTime(event.target.value)} /></label></div>
       <button className="save-button" disabled={saving || !archiveTitle || !startTime || !endTime} onClick={saveArchive}>{saving ? "保存中…" : "長期保存する"}</button>
     </section></div>}
   </main>;
 }
+

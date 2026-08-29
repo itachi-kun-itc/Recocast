@@ -15,13 +15,26 @@ type TargetTime = { basetime: string; validtime: string; elements: string[] };
 const JMA_TIMES = "https://www.jma.go.jp/bosai/jmatile/data/nowc/targetTimes_N1.json";
 const JMA_ROOT = "https://www.jma.go.jp/bosai/jmatile/data/nowc";
 const ALLOWED_ORIGINS = new Set(["https://itachi-kun-itc.github.io", "http://localhost:3000"]);
-const ZOOM = 6;
-const TILE_COLUMNS = 7;
-const TILE_ROWS = 6;
-const TILES = Array.from({ length: TILE_COLUMNS * TILE_ROWS }, (_, index) => ({
-  x: 53 + (index % TILE_COLUMNS),
-  y: 22 + Math.floor(index / TILE_COLUMNS),
-}));
+const ZOOM = 8;
+const DISCOVERY_ZOOM = 6;
+const COLLECTION_BATCH_SIZE = 48;
+const RETENTION_HOURS = 36;
+const DISCOVERY_TILES = Array.from({ length: 42 }, (_, index) => ({ x: 53 + index % 7, y: 22 + Math.floor(index / 7) }));
+const TILE_SETS = [
+  { zoom: 5, tiles: Array.from({ length: 12 }, (_, index) => ({ x: 26 + index % 4, y: 11 + Math.floor(index / 4) })) },
+  { zoom: DISCOVERY_ZOOM, tiles: DISCOVERY_TILES },
+  { zoom: 7, tiles: Array.from({ length: 132 }, (_, index) => ({ x: 107 + index % 12, y: 45 + Math.floor(index / 12) })) },
+];
+
+type Tile = { x: number; y: number };
+
+function highResolutionChildren(parent: Tile) {
+  const scale = 2 ** (ZOOM - DISCOVERY_ZOOM);
+  return Array.from({ length: scale * scale }, (_, index) => ({
+    x: parent.x * scale + index % scale,
+    y: parent.y * scale + Math.floor(index / scale),
+  }));
+}
 
 function cors(request: Request) {
   const origin = request.headers.get("origin") || "";
@@ -49,50 +62,122 @@ async function ensureSchema(env: Env) {
     env.DB.prepare("CREATE INDEX IF NOT EXISTS radar_frames_event_id_idx ON radar_frames(event_id)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS radar_events (id TEXT PRIMARY KEY, title TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, created_at TEXT NOT NULL)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS radar_events_created_at_idx ON radar_events(created_at DESC)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS radar_collection_progress (valid_time TEXT PRIMARY KEY, next_tile INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0, locked_at TEXT)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS radar_frame_manifests (valid_time TEXT PRIMARY KEY, zoom INTEGER NOT NULL, tiles_json TEXT NOT NULL)"),
   ]);
 }
 
 async function cleanup(env: Env) {
-  const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
-  const expired = await env.DB.prepare("SELECT valid_time FROM radar_frames WHERE valid_time < ? AND event_id IS NULL LIMIT 120").bind(cutoff).all<{ valid_time: string }>();
+  const cutoff = new Date(Date.now() - RETENTION_HOURS * 60 * 60 * 1000).toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
+  const expired = await env.DB.prepare("SELECT valid_time FROM radar_frames WHERE valid_time < ? AND event_id IS NULL LIMIT 10").bind(cutoff).all<{ valid_time: string }>();
   if (!expired.results.length) return;
-  const keys = expired.results.flatMap(({ valid_time }) => TILES.map(({ x, y }) => `frames/${valid_time}/${ZOOM}/${x}/${y}.png`));
+  const keys: string[] = [];
+  for (const { valid_time } of expired.results) {
+    keys.push(...TILE_SETS.flatMap(({ zoom, tiles }) => tiles.map(({ x, y }) => `frames/${valid_time}/${zoom}/${x}/${y}.png`)));
+    const manifest = await env.DB.prepare("SELECT zoom, tiles_json FROM radar_frame_manifests WHERE valid_time = ?").bind(valid_time).first<{ zoom: number; tiles_json: string }>();
+    if (manifest) keys.push(...(JSON.parse(manifest.tiles_json) as Tile[]).map(({ x, y }) => `frames/${valid_time}/${manifest.zoom}/${x}/${y}.png`));
+  }
   for (let i = 0; i < keys.length; i += 1000) await env.RADAR_IMAGES.delete(keys.slice(i, i + 1000));
-  await env.DB.batch(expired.results.map(({ valid_time }) => env.DB.prepare("DELETE FROM radar_frames WHERE valid_time = ? AND event_id IS NULL").bind(valid_time)));
+  await env.DB.batch(expired.results.flatMap(({ valid_time }) => [
+    env.DB.prepare("DELETE FROM radar_collection_progress WHERE valid_time = ?").bind(valid_time),
+    env.DB.prepare("DELETE FROM radar_frame_manifests WHERE valid_time = ?").bind(valid_time),
+    env.DB.prepare("DELETE FROM radar_frames WHERE valid_time = ? AND event_id IS NULL").bind(valid_time),
+  ]));
 }
 
 async function collectLatest(env: Env) {
   await ensureSchema(env);
-  const targetsResponse = await fetch(JMA_TIMES, { headers: { "user-agent": "Recocast/1.0 (+https://itachi-kun-itc.github.io/Recocast/)" } });
-  if (!targetsResponse.ok) throw new Error(`JMA target times: ${targetsResponse.status}`);
-  const targets = await targetsResponse.json() as TargetTime[];
-  const target = targets.find((item) => item.elements.includes("hrpns") && item.basetime === item.validtime);
-  if (!target) throw new Error("No observed radar frame available");
-  const exists = await env.DB.prepare("SELECT valid_time, tile_count FROM radar_frames WHERE valid_time = ? AND status = 'ready'").bind(target.validtime).first<{ valid_time: string; tile_count: number }>();
-  if (exists?.tile_count === TILES.length && await env.RADAR_IMAGES.head(`frames/${target.validtime}/${ZOOM}/${TILES[0].x}/${TILES[0].y}.png`)) {
-    await cleanup(env);
+  type Progress = { valid_time: string; base_time: string; next_tile: number; total_bytes: number; locked_at: string | null };
+  let progress = await env.DB.prepare("SELECT p.valid_time, f.base_time, p.next_tile, p.total_bytes, p.locked_at FROM radar_collection_progress p JOIN radar_frames f ON f.valid_time = p.valid_time ORDER BY p.valid_time LIMIT 1").first<Progress>();
+
+  if (!progress) {
+    const targetsResponse = await fetch(JMA_TIMES, { headers: { "user-agent": "Recocast/1.0 (+https://itachi-kun-itc.github.io/Recocast/)" } });
+    if (!targetsResponse.ok) throw new Error(`JMA target times: ${targetsResponse.status}`);
+    const targets = await targetsResponse.json() as TargetTime[];
+    const target = targets.find((item) => item.elements.includes("hrpns") && item.basetime === item.validtime);
+    if (!target) throw new Error("No observed radar frame available");
+    const exists = await env.DB.prepare("SELECT f.valid_time FROM radar_frames f JOIN radar_frame_manifests m ON m.valid_time = f.valid_time WHERE f.valid_time = ? AND f.status = 'ready' AND m.zoom = ?").bind(target.validtime, ZOOM).first();
+    const overviewExists = exists && await env.RADAR_IMAGES.head(`frames/${target.validtime}/${DISCOVERY_ZOOM}/${DISCOVERY_TILES[0].x}/${DISCOVERY_TILES[0].y}.png`);
+    if (overviewExists) {
+      await cleanup(env);
+      return;
+    }
+    const createdAt = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO radar_frames (valid_time, base_time, status, tile_count, total_bytes, created_at) VALUES (?, ?, 'collecting', 0, 0, ?) ON CONFLICT(valid_time) DO UPDATE SET base_time = excluded.base_time, status = 'collecting', tile_count = 0, total_bytes = 0, created_at = excluded.created_at")
+        .bind(target.validtime, target.basetime, createdAt),
+      env.DB.prepare("INSERT OR IGNORE INTO radar_collection_progress (valid_time, next_tile, total_bytes, locked_at) VALUES (?, -1, 0, NULL)").bind(target.validtime),
+    ]);
+    progress = { valid_time: target.validtime, base_time: target.basetime, next_tile: -1, total_bytes: 0, locked_at: null };
+  }
+
+  const lockId = new Date().toISOString();
+  const staleLock = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  const lock = await env.DB.prepare("UPDATE radar_collection_progress SET locked_at = ? WHERE valid_time = ? AND (locked_at IS NULL OR locked_at < ?)")
+    .bind(lockId, progress.valid_time, staleLock).run();
+  if (!lock.meta.changes) return;
+
+  if (progress.next_tile < 0) {
+    const discovery = await Promise.all(DISCOVERY_TILES.map(async ({ x, y }) => {
+      const response = await fetch(jmaTileUrl(progress.base_time, progress.valid_time, DISCOVERY_ZOOM, x, y), { headers: { "user-agent": "Recocast/1.0 (+https://itachi-kun-itc.github.io/Recocast/)" } });
+      if (!response.ok) throw new Error(`JMA discovery tile: ${response.status}`);
+      const bytes = await response.arrayBuffer();
+      await env.RADAR_IMAGES.put(`frames/${progress.valid_time}/${DISCOVERY_ZOOM}/${x}/${y}.png`, bytes, {
+        httpMetadata: { contentType: "image/png", cacheControl: "public, max-age=31536000, immutable" },
+        customMetadata: { source: "Japan Meteorological Agency", baseTime: progress.base_time, validTime: progress.valid_time },
+      });
+      return { tile: { x, y }, bytes: bytes.byteLength };
+    }));
+    const discoveryBytes = discovery.reduce((sum, item) => sum + item.bytes, 0);
+    const rainyParents = discovery.filter((item) => item.bytes > 400).map((item) => item.tile);
+    const tiles = rainyParents.flatMap(highResolutionChildren);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO radar_frame_manifests (valid_time, zoom, tiles_json) VALUES (?, ?, ?) ON CONFLICT(valid_time) DO UPDATE SET zoom = excluded.zoom, tiles_json = excluded.tiles_json").bind(progress.valid_time, ZOOM, JSON.stringify(tiles)),
+      ...(tiles.length
+        ? [env.DB.prepare("UPDATE radar_collection_progress SET next_tile = 0, total_bytes = ?, locked_at = NULL WHERE valid_time = ? AND locked_at = ?").bind(discoveryBytes, progress.valid_time, lockId)]
+        : [
+            env.DB.prepare("UPDATE radar_frames SET status = 'ready', tile_count = ?, total_bytes = ? WHERE valid_time = ?").bind(DISCOVERY_TILES.length, discoveryBytes, progress.valid_time),
+            env.DB.prepare("DELETE FROM radar_collection_progress WHERE valid_time = ? AND locked_at = ?").bind(progress.valid_time, lockId),
+          ]),
+    ]);
+    if (!tiles.length) await cleanup(env);
     return;
   }
 
-  await env.DB.prepare("INSERT OR REPLACE INTO radar_frames (valid_time, base_time, status, tile_count, total_bytes, created_at) VALUES (?, ?, 'collecting', 0, 0, ?)")
-    .bind(target.validtime, target.basetime, new Date().toISOString()).run();
-
-  let totalBytes = 0;
-  const results = await Promise.all(TILES.map(async ({ x, y }) => {
-    const response = await fetch(jmaTileUrl(target.basetime, target.validtime, ZOOM, x, y), { headers: { "user-agent": "Recocast/1.0 (+https://itachi-kun-itc.github.io/Recocast/)" } });
+  const manifest = await env.DB.prepare("SELECT tiles_json FROM radar_frame_manifests WHERE valid_time = ? AND zoom = ?").bind(progress.valid_time, ZOOM).first<{ tiles_json: string }>();
+  if (!manifest) throw new Error("Radar tile manifest is missing");
+  const tiles = JSON.parse(manifest.tiles_json) as Tile[];
+  const batch = tiles.slice(progress.next_tile, progress.next_tile + COLLECTION_BATCH_SIZE);
+  let batchBytes = 0;
+  const results = await Promise.all(batch.map(async ({ x, y }) => {
+    const response = await fetch(jmaTileUrl(progress.base_time, progress.valid_time, ZOOM, x, y), { headers: { "user-agent": "Recocast/1.0 (+https://itachi-kun-itc.github.io/Recocast/)" } });
     if (!response.ok) return false;
     const bytes = await response.arrayBuffer();
-    totalBytes += bytes.byteLength;
-    await env.RADAR_IMAGES.put(`frames/${target.validtime}/${ZOOM}/${x}/${y}.png`, bytes, {
+    batchBytes += bytes.byteLength;
+    await env.RADAR_IMAGES.put(`frames/${progress.valid_time}/${ZOOM}/${x}/${y}.png`, bytes, {
       httpMetadata: { contentType: "image/png", cacheControl: "public, max-age=31536000, immutable" },
-      customMetadata: { source: "Japan Meteorological Agency", baseTime: target.basetime, validTime: target.validtime },
+      customMetadata: { source: "Japan Meteorological Agency", baseTime: progress.base_time, validTime: progress.valid_time },
     });
     return true;
   }));
-  const tileCount = results.filter(Boolean).length;
-  await env.DB.prepare("UPDATE radar_frames SET status = 'ready', tile_count = ?, total_bytes = ? WHERE valid_time = ?")
-    .bind(tileCount, totalBytes, target.validtime).run();
-  await cleanup(env);
+
+  if (results.some((result) => !result)) {
+    await env.DB.prepare("UPDATE radar_collection_progress SET locked_at = NULL WHERE valid_time = ? AND locked_at = ?").bind(progress.valid_time, lockId).run();
+    throw new Error("One or more JMA tiles failed");
+  }
+
+  const nextTile = progress.next_tile + batch.length;
+  const totalBytes = progress.total_bytes + batchBytes;
+  if (nextTile >= tiles.length) {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE radar_frames SET status = 'ready', tile_count = ?, total_bytes = ? WHERE valid_time = ?").bind(DISCOVERY_TILES.length + tiles.length, totalBytes, progress.valid_time),
+      env.DB.prepare("DELETE FROM radar_collection_progress WHERE valid_time = ? AND locked_at = ?").bind(progress.valid_time, lockId),
+    ]);
+    await cleanup(env);
+  } else {
+    await env.DB.prepare("UPDATE radar_collection_progress SET next_tile = ?, total_bytes = ?, locked_at = NULL WHERE valid_time = ? AND locked_at = ?")
+      .bind(nextTile, totalBytes, progress.valid_time, lockId).run();
+  }
 }
 
 async function route(request: Request, env: Env, ctx: ExecutionContext) {
@@ -101,9 +186,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   await ensureSchema(env);
 
   if (url.pathname === "/api/frames" && request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT valid_time, base_time, tile_count, total_bytes, event_id FROM radar_frames WHERE status = 'ready' AND tile_count = ? ORDER BY valid_time DESC LIMIT 900").bind(TILES.length).all();
-    if (!rows.results.length) ctx.waitUntil(collectLatest(env));
-    return json(request, { frames: rows.results, zoom: ZOOM, tiles: TILES, retentionDays: 3 });
+    const rows = await env.DB.prepare("SELECT f.valid_time, f.base_time, f.tile_count, f.total_bytes, f.event_id, m.tiles_json FROM radar_frames f JOIN radar_frame_manifests m ON m.valid_time = f.valid_time WHERE f.status = 'ready' AND m.zoom = ? ORDER BY f.valid_time DESC LIMIT 900").bind(ZOOM).all<{ valid_time: string; base_time: string; tile_count: number; total_bytes: number; event_id: string | null; tiles_json: string }>();
+    ctx.waitUntil(collectLatest(env));
+    return json(request, { frames: rows.results.map(({ tiles_json, ...frame }) => ({ ...frame, tiles: JSON.parse(tiles_json) })), zoom: ZOOM, overviewZoom: DISCOVERY_ZOOM, overviewTiles: DISCOVERY_TILES, retentionDays: 1.5 });
   }
 
   if (url.pathname === "/api/events" && request.method === "GET") {
@@ -131,9 +216,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   }
 
   if (url.pathname === "/api/stats" && request.method === "GET") {
-    const stats = await env.DB.prepare("SELECT COUNT(*) AS frame_count, COALESCE(SUM(total_bytes), 0) AS total_bytes, MIN(valid_time) AS oldest_time, MAX(valid_time) AS latest_time FROM radar_frames WHERE status = 'ready' AND tile_count = ?").bind(TILES.length).first();
+    const stats = await env.DB.prepare("SELECT COUNT(*) AS frame_count, COALESCE(SUM(f.total_bytes), 0) AS total_bytes, MIN(f.valid_time) AS oldest_time, MAX(f.valid_time) AS latest_time FROM radar_frames f JOIN radar_frame_manifests m ON m.valid_time = f.valid_time WHERE f.status = 'ready' AND m.zoom = ?").bind(ZOOM).first();
     const events = await env.DB.prepare("SELECT COUNT(*) AS event_count FROM radar_events").first();
-    return json(request, { ...stats, ...events, retentionDays: 3 });
+    return json(request, { ...stats, ...events, retentionDays: 1.5 });
   }
 
   const tileMatch = url.pathname.match(/^\/api\/frames\/(\d{14})\/tiles\/(\d+)\/(\d+)\/(\d+)\.png$/);
@@ -147,7 +232,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
     return new Response(object.body, { headers });
   }
 
-  if (url.pathname === "/health") return json(request, { ok: true, source: "気象庁・高解像度降水ナウキャスト", retentionDays: 3, zoom: ZOOM });
+  if (url.pathname === "/health") return json(request, { ok: true, source: "気象庁・高解像度降水ナウキャスト", retentionDays: 1.5, zoom: ZOOM });
   return json(request, { error: "Not found" }, { status: 404 });
 }
 
@@ -157,3 +242,4 @@ export default {
     ctx.waitUntil(collectLatest(env));
   },
 };
+
