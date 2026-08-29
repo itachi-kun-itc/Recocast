@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -9,6 +9,13 @@ export const metadata: Metadata = {
   icons: { icon: "/Recocast/favicon.svg", shortcut: "/Recocast/favicon.svg" },
   openGraph: { title: "Recocast — 雨雲を、記録する。", description: "気象庁ナウキャストの直近3日と、大雨時の雨雲の流れを保存。", images: [{ url: "/Recocast/og.png", width: 1536, height: 1024 }] },
   twitter: { card: "summary_large_image", title: "Recocast — 雨雲を、記録する。", description: "気象庁ナウキャストの直近3日と、大雨時の雨雲の流れを保存。", images: ["/Recocast/og.png"] },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

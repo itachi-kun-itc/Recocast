@@ -39,6 +39,14 @@ function tileUrl(frame: Frame, x: number, y: number, zoom: number) {
   return `${API}/api/frames/${frame.valid_time}/tiles/${zoom}/${x}/${y}.png`;
 }
 
+function tileCoordinates(x: number, y: number, zoom: number): [[number, number], [number, number], [number, number], [number, number]] {
+  const scale = 2 ** zoom;
+  const longitude = (tileX: number) => tileX / scale * 360 - 180;
+  const latitude = (tileY: number) => Math.atan(Math.sinh(Math.PI * (1 - 2 * tileY / scale))) * 180 / Math.PI;
+  const west = longitude(x), east = longitude(x + 1), north = latitude(y), south = latitude(y + 1);
+  return [[west, north], [east, north], [east, south], [west, south]];
+}
+
 function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: number; tiles: Tile[]; zoom: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -52,17 +60,12 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
       zoom: 4.45,
       pitch: 0,
       bearing: 0,
-      minZoom: 4.45,
-      maxZoom: 4.45,
+      minZoom: 3,
+      maxZoom: 7.5,
       maxPitch: 0,
-      scrollZoom: false,
-      boxZoom: false,
-      doubleClickZoom: false,
-      keyboard: false,
       dragRotate: false,
       pitchWithRotate: false,
       touchPitch: false,
-      touchZoomRotate: false,
       attributionControl: false,
       style: {
         version: 8,
@@ -80,6 +83,9 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
         ],
       },
     });
+    map.touchZoomRotate.disableRotation();
+    map.keyboard.disableRotation();
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
     map.on("load", () => {
       map.addSource("prefectures", { type: "geojson", data: "https://raw.githubusercontent.com/geolonia/prefecture-tiles/master/prefectures.geojson" });
@@ -94,24 +100,31 @@ function JapanMap({ frame, opacity, tiles, zoom }: { frame?: Frame; opacity: num
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    if (map.getLayer("radar")) map.removeLayer("radar");
-    if (map.getSource("radar")) map.removeSource("radar");
-    if (!frame || !tiles.length) return;
-    map.addSource("radar", {
-      type: "raster",
-      tiles: [`${API}/api/frames/${frame.valid_time}/tiles/${zoom}/{x}/{y}.png`],
-      tileSize: 256,
-      minzoom: zoom,
-      maxzoom: zoom,
-      bounds: [122.4, 23, 153.9, 46.1],
+    tiles.forEach(({ x, y }) => {
+      const id = `radar-${x}-${y}`;
+      if (map.getLayer(id)) map.removeLayer(id);
+      if (map.getSource(id)) map.removeSource(id);
     });
-    map.addLayer({ id: "radar", type: "raster", source: "radar", paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, "prefecture-border");
-  }, [frame, mapReady, tiles.length, zoom]);
+    if (!frame || !tiles.length) return;
+    tiles.forEach(({ x, y }) => {
+      const id = `radar-${x}-${y}`;
+      map.addSource(id, {
+        type: "image",
+        url: tileUrl(frame, x, y, zoom),
+        coordinates: tileCoordinates(x, y, zoom),
+      });
+      map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } }, "prefecture-border");
+    });
+  }, [frame, mapReady, tiles, zoom]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (map?.getLayer("radar")) map.setPaintProperty("radar", "raster-opacity", opacity);
-  }, [opacity]);
+    if (!map) return;
+    tiles.forEach(({ x, y }) => {
+      const id = `radar-${x}-${y}`;
+      if (map.getLayer(id)) map.setPaintProperty(id, "raster-opacity", opacity);
+    });
+  }, [opacity, tiles]);
 
   return <div ref={containerRef} className="map-canvas" aria-label="気象庁ナウキャストを重ねたMapLibre日本地図" />;
 }
@@ -141,6 +154,24 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey);
   }, [frames.length]);
+
+  useEffect(() => {
+    const preventPageWheelZoom = (event: WheelEvent) => {
+      if (event.ctrlKey || event.metaKey) event.preventDefault();
+    };
+    const preventPageKeyZoom = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && ["+", "-", "=", "0"].includes(event.key)) event.preventDefault();
+    };
+    const preventGesture = (event: Event) => event.preventDefault();
+    document.addEventListener("wheel", preventPageWheelZoom, { passive: false });
+    document.addEventListener("keydown", preventPageKeyZoom);
+    document.addEventListener("gesturestart", preventGesture, { passive: false });
+    return () => {
+      document.removeEventListener("wheel", preventPageWheelZoom);
+      document.removeEventListener("keydown", preventPageKeyZoom);
+      document.removeEventListener("gesturestart", preventGesture);
+    };
+  }, []);
 
   const current = frames[active];
   const markerIndices = useMemo(() => {
