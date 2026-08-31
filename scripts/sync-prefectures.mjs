@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 
 const source = "https://raw.githubusercontent.com/wvdtc7bjwn-bit/MeteoScope/main/public/data/japan-prefectures-map.geojson";
 const destination = new URL("../public/data/japan-prefectures-map.geojson", import.meta.url);
-const tolerance = 0.005;
+const tolerance = 0.015;
 
 function squaredSegmentDistance(point, start, end) {
   let x = start[0];
